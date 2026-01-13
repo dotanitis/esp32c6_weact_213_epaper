@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <time.h>
 
 #include <WiFiManager.h>     // tzapu
 #include <ArduinoJson.h>     // bblanchon
@@ -35,15 +36,19 @@ Preferences prefs;
 static String g_apiKey;
 static String g_cityQuery; // e.g. "Beer Sheva,IL"
 static String g_units = "metric"; // "metric" or "imperial"
+static uint32_t g_updateIntervalHours = 12; // Default 12 hours
 
 // ===== Weather data =====
 struct WeatherData {
   float temp = NAN;
   float tempMin = NAN;
   float tempMax = NAN;
+  float feelsLike = NAN;       // "feels like" temperature
   int weatherId = -1;          // OpenWeather "id" code
-  String main;                // "Clear", "Clouds", ...
-  String description;         // "few clouds"
+  String main;                 // "Clear", "Clouds", ...
+  String description;          // "few clouds"
+  String iconCode;             // Icon code from API (e.g., "01d", "02n")
+  unsigned long timestamp = 0; // Unix timestamp of data retrieval
 };
 
 static const char* OW_HOST = "api.openweathermap.org";
@@ -117,17 +122,35 @@ static void drawMist(int x, int y) {
   display.drawLine(x, y + 42, x + 70, y + 42, GxEPD_BLACK);
 }
 
-static void drawWeatherIcon(int x, int y, int weatherId, const String& main) {
-  // OpenWeather condition groups:
-  // 2xx thunderstorm, 3xx drizzle, 5xx rain, 6xx snow, 7xx atmosphere, 800 clear, 80x clouds
+static void drawWeatherIcon(int x, int y, const String& iconCode, int weatherId, const String& main) {
+  // Icon code mapping from OpenWeather API
+  // Always use night icons per user preference (ignore day/night suffix)
+  // Icon codes: 01=clear, 02=few clouds, 03=scattered, 04=broken, 09=shower rain,
+  //             10=rain, 11=thunderstorm, 13=snow, 50=mist
+  
+  if (iconCode.length() >= 2) {
+    String baseIcon = iconCode.substring(0, 2);
+    
+    if (baseIcon == "01") { drawSun(x + 36, y + 28); return; }        // Clear
+    if (baseIcon == "02") { drawCloud(x, y); return; }                // Few clouds
+    if (baseIcon == "03") { drawSnow(x, y); return; }                 // Scattered clouds -> Snow per user request
+    if (baseIcon == "04") { drawCloud(x, y); return; }                // Broken clouds
+    if (baseIcon == "09") { drawRain(x, y); return; }                 // Shower rain
+    if (baseIcon == "10") { drawRain(x, y); return; }                 // Rain
+    if (baseIcon == "11") { drawStorm(x, y); return; }                // Thunderstorm
+    if (baseIcon == "13") { drawSnow(x, y); return; }                 // Snow
+    if (baseIcon == "50") { drawMist(x, y); return; }                 // Mist
+  }
+  
+  // Fallback to weather ID based drawing
   if (weatherId >= 200 && weatherId < 300) { drawStorm(x, y); return; }
   if (weatherId >= 300 && weatherId < 600) { drawRain(x, y);  return; }
   if (weatherId >= 600 && weatherId < 700) { drawSnow(x, y);  return; }
   if (weatherId >= 700 && weatherId < 800) { drawMist(x, y);  return; }
   if (weatherId == 800) { drawSun(x + 36, y + 28); return; }
   if (weatherId > 800 && weatherId < 900) { drawCloud(x, y); return; }
-
-  // fallback
+  
+  // Final fallback
   if (main == "Clear") drawSun(x + 36, y + 28);
   else if (main == "Clouds") drawCloud(x, y);
   else if (main == "Rain" || main == "Drizzle") drawRain(x, y);
@@ -144,13 +167,27 @@ static void renderWeather(const WeatherData& w) {
   String tempNow = "--.-";
   String tMin = "--.-";
   String tMax = "--.-";
+  String feelsLike = "--.-";
 
-  if (!isnan(w.temp))    tempNow = String(w.temp, 1);
-  if (!isnan(w.tempMin)) tMin    = String(w.tempMin, 1);
-  if (!isnan(w.tempMax)) tMax    = String(w.tempMax, 1);
+  if (!isnan(w.temp))      tempNow = String(w.temp, 1);
+  if (!isnan(w.tempMin))   tMin    = String(w.tempMin, 1);
+  if (!isnan(w.tempMax))   tMax    = String(w.tempMax, 1);
+  if (!isnan(w.feelsLike)) feelsLike = String(w.feelsLike, 1);
 
-  // Use UTF-8 degree symbol sometimes fails on some fonts;
-  // fallback is "C" or use (char)247? We'll keep it safe: "C"
+  // Format timestamp
+  String timeStr = "--:--";
+  String dateStr = "--/--";
+  if (w.timestamp > 0) {
+    time_t t = w.timestamp;
+    struct tm* tm_info = localtime(&t);
+    char timeBuf[16];
+    char dateBuf[16];
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M", tm_info);
+    strftime(dateBuf, sizeof(dateBuf), "%d/%m/%y", tm_info);
+    timeStr = String(timeBuf);
+    dateStr = String(dateBuf);
+  }
+
   String bigLine = tempNow + "C";
 
   display.firstPage();
@@ -164,12 +201,18 @@ static void renderWeather(const WeatherData& w) {
     display.print("Today: ");
     display.print(g_cityQuery);
 
+    // ---- Timestamp line (under header) ----
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(8, 32);
+    display.print(dateStr);
+    display.print(" ");
+    display.print(timeStr);
+
     // small divider line
-    display.drawLine(0, 22, display.width(), 22, GxEPD_BLACK);
+    display.drawLine(0, 38, display.width(), 38, GxEPD_BLACK);
 
     // ---- Icon (right side) ----
-    // tuned to sit nicely on the right
-    drawWeatherIcon(display.width() - 66, 26, w.weatherId, w.main);
+    drawWeatherIcon(display.width() - 66, 42, w.iconCode, w.weatherId, w.main);
 
     // ---- Big temperature (centered) ----
     // Keep it away from the icon area by centering but it’s fine visually on 2.13"
@@ -204,6 +247,7 @@ static void loadSettings() {
   prefs.begin("weather", true);
   g_apiKey = prefs.getString("apiKey", "");     // no default secret
   g_cityQuery = prefs.getString("city", "Beer Sheva,IL");
+  g_updateIntervalHours = prefs.getUInt("interval", 12); // Default 12 hours
   prefs.end();
 }
 
@@ -211,6 +255,7 @@ static void saveSettings(const String& apiKey, const String& city) {
   prefs.begin("weather", false);
   prefs.putString("apiKey", apiKey);
   prefs.putString("city", city);
+  prefs.putUInt("interval", g_updateIntervalHours);
   prefs.end();
 }
 
@@ -305,18 +350,45 @@ static bool fetchWeather(WeatherData& out) {
     return false;
   }
 
-  out.temp    = doc["main"]["temp"].as<float>();
-  out.tempMin = doc["main"]["temp_min"].as<float>();
-  out.tempMax = doc["main"]["temp_max"].as<float>();
+  out.temp      = doc["main"]["temp"].as<float>();
+  out.tempMin   = doc["main"]["temp_min"].as<float>();
+  out.tempMax   = doc["main"]["temp_max"].as<float>();
+  out.feelsLike = doc["main"]["feels_like"].as<float>();
 
   out.weatherId   = doc["weather"][0]["id"].as<int>();
   out.main        = String((const char*)doc["weather"][0]["main"]);
   out.description = String((const char*)doc["weather"][0]["description"]);
+  out.iconCode    = String((const char*)doc["weather"][0]["icon"]);
+  
+  // Store current time as timestamp
+  out.timestamp = time(nullptr);
 
-  Serial.printf("Weather: %.1f (min %.1f max %.1f) id=%d main=%s\n",
-                out.temp, out.tempMin, out.tempMax, out.weatherId, out.main.c_str());
+  Serial.printf("Weather: %.1f (feels %.1f, min %.1f max %.1f) id=%d main=%s icon=%s\n",
+                out.temp, out.feelsLike, out.tempMin, out.tempMax, 
+                out.weatherId, out.main.c_str(), out.iconCode.c_str());
 
   return true;
+}
+
+// ---------------- Time sync helper ----------------
+static void syncTime() {
+  // Configure NTP
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Syncing time...");
+  
+  int retries = 0;
+  while (time(nullptr) < 100000 && retries < 20) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  Serial.println();
+  
+  if (time(nullptr) > 100000) {
+    Serial.println("Time synced successfully");
+  } else {
+    Serial.println("Time sync failed, using relative time");
+  }
 }
 
 // ---------------- Setup / Loop ----------------
@@ -359,8 +431,13 @@ void setup() {
     WeatherData dummy;
     dummy.main = "No WiFi";
     renderWeather(dummy);
-    return;
+    Serial.println("Going to sleep (WiFi failed)...");
+    esp_sleep_enable_timer_wakeup(g_updateIntervalHours * 3600ULL * 1000000ULL);
+    esp_deep_sleep_start();
   }
+
+  // Sync time from NTP
+  syncTime();
 
   WeatherData w;
   if (fetchWeather(w)) {
@@ -370,8 +447,18 @@ void setup() {
     err.main = "Weather ERR";
     renderWeather(err);
   }
+
+  // Disconnect WiFi to save power
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Enter deep sleep for configured interval
+  uint64_t sleepTime = g_updateIntervalHours * 3600ULL * 1000000ULL; // Convert hours to microseconds
+  Serial.printf("Going to sleep for %u hours...\n", g_updateIntervalHours);
+  esp_sleep_enable_timer_wakeup(sleepTime);
+  esp_deep_sleep_start();
 }
 
 void loop() {
-  // You can later add periodic refresh here (e.g., every 30 minutes)
+  // Not used - device wakes from deep sleep and runs setup() again
 }
