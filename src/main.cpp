@@ -37,6 +37,8 @@ static String g_apiKey;
 static String g_cityQuery; // e.g. "Beer Sheva,IL"
 static String g_units = "metric"; // "metric" or "imperial"
 static uint32_t g_updateIntervalHours = 12; // Default 12 hours
+static uint8_t g_nightModeStartHour = 20;   // Night mode starts at 20:00 (8 PM)
+static uint8_t g_nightModeEndHour = 7;      // Night mode ends at 07:00 (7 AM)
 
 // ===== Weather data =====
 struct WeatherData {
@@ -51,7 +53,30 @@ struct WeatherData {
   unsigned long timestamp = 0; // Unix timestamp of data retrieval
 };
 
+// ===== Forecast data for tomorrow =====
+struct ForecastData {
+  float tempMin = NAN;         // Tomorrow min temp
+  float tempMax = NAN;         // Tomorrow max temp
+  int weatherId = -1;          // Tomorrow weather ID
+  String main;                 // Tomorrow weather main
+  String iconCode;             // Tomorrow icon code
+};
+
 static const char* OW_HOST = "api.openweathermap.org";
+
+// ===== Display mode helpers =====
+static bool isNightMode() {
+  time_t now = time(nullptr);
+  struct tm* tm_info = localtime(&now);
+  int hour = tm_info->tm_hour;
+  
+  // Night mode spans midnight (e.g., 20:00 to 07:00)
+  if (g_nightModeStartHour > g_nightModeEndHour) {
+    return (hour >= g_nightModeStartHour || hour < g_nightModeEndHour);
+  } else {
+    return (hour >= g_nightModeStartHour && hour < g_nightModeEndHour);
+  }
+}
 
 // ---------------- Vector icons (simple, B/W) ----------------
 static void drawSun(int cx, int cy) {
@@ -242,12 +267,99 @@ static void renderWeather(const WeatherData& w) {
   display.hibernate();
 }
 
+// ===== Split-screen render for night mode =====
+static void renderWeatherSplitScreen(const WeatherData& current, const ForecastData& tomorrow) {
+  display.setRotation(1);
+  display.setFullWindow();
+
+  // Format current temperature
+  String tempNow = "--.-";
+  if (!isnan(current.temp)) tempNow = String(current.temp, 1);
+
+  // Format tomorrow temps
+  String tMin = "--.-";
+  String tMax = "--.-";
+  if (!isnan(tomorrow.tempMin)) tMin = String(tomorrow.tempMin, 1);
+  if (!isnan(tomorrow.tempMax)) tMax = String(tomorrow.tempMax, 1);
+
+  // Format timestamp
+  String timeStr = "--:--";
+  if (current.timestamp > 0) {
+    time_t t = current.timestamp;
+    struct tm* tm_info = localtime(&t);
+    char timeBuf[16];
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M", tm_info);
+    timeStr = String(timeBuf);
+  }
+
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+
+    // ---- Header ----
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(8, 16);
+    display.print(g_cityQuery);
+    display.print(" ");
+    display.print(timeStr);
+
+    // ---- Divider line below header ----
+    display.drawLine(0, 22, display.width(), 22, GxEPD_BLACK);
+
+    // ---- CURRENT WEATHER (Left side) ----
+    // Small icon for current weather
+    drawWeatherIcon(8, 28, current.iconCode, current.weatherId, current.main);
+
+    // Current temperature (centered on left half)
+    display.setFont(&FreeMonoBold12pt7b);
+    display.setCursor(12, 65);
+    display.print(tempNow);
+    display.print("C");
+
+    // Current condition
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(8, 80);
+    String cond = (current.main.length() ? current.main : String("Weather"));
+    display.print(cond);
+
+    // ---- VERTICAL DIVIDER ----
+    int dividerX = display.width() / 2;
+    display.drawLine(dividerX, 22, dividerX, display.height(), GxEPD_BLACK);
+
+    // ---- TOMORROW'S FORECAST (Right side) ----
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(dividerX + 8, 28);
+    display.print("Tomorrow");
+
+    // Small icon for tomorrow
+    drawWeatherIcon(dividerX + 12, 42, tomorrow.iconCode, tomorrow.weatherId, tomorrow.main);
+
+    // Tomorrow temps
+    display.setFont(&FreeMonoBold12pt7b);
+    display.setCursor(dividerX + 8, 78);
+    display.print("Min: ");
+    display.print(tMin);
+    display.print("C");
+
+    display.setCursor(dividerX + 8, 96);
+    display.print("Max: ");
+    display.print(tMax);
+    display.print("C");
+
+  } while (display.nextPage());
+
+  display.hibernate();
+}
+
 // ---------------- Preferences helpers ----------------
 static void loadSettings() {
   prefs.begin("weather", true);
   g_apiKey = prefs.getString("apiKey", "");     // no default secret
   g_cityQuery = prefs.getString("city", "Beer Sheva,IL");
   g_updateIntervalHours = prefs.getUInt("interval", 12); // Default 12 hours
+  g_nightModeStartHour = prefs.getUChar("nightStart", 20); // Default 20:00
+  g_nightModeEndHour = prefs.getUChar("nightEnd", 7);     // Default 07:00
   prefs.end();
 }
 
@@ -256,6 +368,8 @@ static void saveSettings(const String& apiKey, const String& city) {
   prefs.putString("apiKey", apiKey);
   prefs.putString("city", city);
   prefs.putUInt("interval", g_updateIntervalHours);
+  prefs.putUChar("nightStart", g_nightModeStartHour);
+  prefs.putUChar("nightEnd", g_nightModeEndHour);
   prefs.end();
 }
 
@@ -370,6 +484,70 @@ static bool fetchWeather(WeatherData& out) {
   return true;
 }
 
+// ===== Forecast fetch (tomorrow's weather) =====
+static bool fetchForecast(ForecastData& out) {
+  if (g_apiKey.length() == 0) {
+    Serial.println("No API key for forecast fetch");
+    return false;
+  }
+
+  // Use 5-day forecast API to get tomorrow's weather
+  // https://api.openweathermap.org/data/2.5/forecast?q=...&appid=...&units=metric&cnt=10
+  String cityEncoded = urlEncodeCity(g_cityQuery);
+  String url = String("https://") + OW_HOST + "/data/2.5/forecast?q=" +
+               cityEncoded + "&appid=" + g_apiKey + "&units=" + g_units + "&cnt=10";
+  Serial.println("Fetching forecast...");
+  Serial.println(url);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+  if (!https.begin(client, url)) {
+    Serial.println("Forecast HTTP begin failed");
+    return false;
+  }
+
+  int code = https.GET();
+  Serial.printf("Forecast HTTP GET code: %d\n", code);
+  if (code != 200) {
+    Serial.printf("Forecast GET failed, code=%d\n", code);
+    https.end();
+    return false;
+  }
+
+  String payload = https.getString();
+  https.end();
+
+  // Parse forecast JSON
+  StaticJsonDocument<4096> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("Forecast JSON parse failed: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  // Get forecast data from list (first entry represents next period forecast)
+  JsonArray list = doc["list"];
+  if (list.size() > 0) {
+    JsonObject forecast = list[0];
+    out.tempMin   = forecast["main"]["temp_min"].as<float>();
+    out.tempMax   = forecast["main"]["temp_max"].as<float>();
+    out.weatherId = forecast["weather"][0]["id"].as<int>();
+    out.main      = String((const char*)forecast["weather"][0]["main"]);
+    out.iconCode  = String((const char*)forecast["weather"][0]["icon"]);
+
+    Serial.printf("Forecast: min %.1f, max %.1f, id=%d, main=%s, icon=%s\n",
+                  out.tempMin, out.tempMax, out.weatherId, out.main.c_str(), out.iconCode.c_str());
+  } else {
+    Serial.println("No forecast data available");
+    return false;
+  }
+
+  return true;
+}
+
 // ---------------- Time sync helper ----------------
 static void syncTime() {
   // Configure NTP
@@ -439,13 +617,40 @@ void setup() {
   // Sync time from NTP
   syncTime();
 
-  WeatherData w;
-  if (fetchWeather(w)) {
-    renderWeather(w);
+  // Check if night mode is active and fetch appropriate data
+  if (isNightMode()) {
+    Serial.println("Night mode active - fetching forecast");
+    
+    WeatherData w;
+    ForecastData f;
+    
+    bool currentOk = fetchWeather(w);
+    bool forecastOk = fetchForecast(f);
+    
+    if (currentOk && forecastOk) {
+      renderWeatherSplitScreen(w, f);
+    } else {
+      // Fallback to full detailed view if forecast fails
+      if (currentOk) {
+        renderWeather(w);
+      } else {
+        WeatherData err;
+        err.main = "Weather ERR";
+        renderWeather(err);
+      }
+    }
   } else {
-    WeatherData err;
-    err.main = "Weather ERR";
-    renderWeather(err);
+    // Day mode - show detailed current weather
+    Serial.println("Day mode active - showing detailed weather");
+    
+    WeatherData w;
+    if (fetchWeather(w)) {
+      renderWeather(w);
+    } else {
+      WeatherData err;
+      err.main = "Weather ERR";
+      renderWeather(err);
+    }
   }
 
   // Disconnect WiFi to save power
