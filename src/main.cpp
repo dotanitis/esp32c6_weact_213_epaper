@@ -336,7 +336,7 @@ static void renderWeatherSplitScreen(const WeatherData& current, const ForecastD
     drawWeatherIcon(dividerX + 12, 42, tomorrow.iconCode, tomorrow.weatherId, tomorrow.main);
 
     // Tomorrow temps
-    display.setFont(&FreeMonoBold12pt7b);
+    display.setFont(&FreeMonoBold9pt7b);
     display.setCursor(dividerX + 8, 78);
     display.print("Min: ");
     display.print(tMin);
@@ -617,6 +617,9 @@ void setup() {
   // Sync time from NTP
   syncTime();
 
+  Serial.printf("Current time check - Hour: %d, Night mode start: %d, Night mode end: %d\n", 
+                localtime(&(time_t){time(nullptr)})->tm_hour, g_nightModeStartHour, g_nightModeEndHour);
+  
   // Check if night mode is active and fetch appropriate data
   if (isNightMode()) {
     Serial.println("Night mode active - fetching forecast");
@@ -628,8 +631,10 @@ void setup() {
     bool forecastOk = fetchForecast(f);
     
     if (currentOk && forecastOk) {
+      Serial.println("Both current and forecast data OK - rendering split screen");
       renderWeatherSplitScreen(w, f);
     } else {
+      Serial.printf("Current OK: %d, Forecast OK: %d - falling back to detailed view\n", currentOk, forecastOk);
       // Fallback to full detailed view if forecast fails
       if (currentOk) {
         renderWeather(w);
@@ -656,6 +661,9 @@ void setup() {
   // Disconnect WiFi to save power
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+
+  Serial.println("Display rendered successfully. Press any key to continue or device will sleep in 10 seconds...");
+  delay(10000);  // Wait 10 seconds before deep sleep - gives time to check output
 
   // Enter deep sleep for configured interval
   uint64_t sleepTime = g_updateIntervalHours * 3600ULL * 1000000ULL; // Convert hours to microseconds
