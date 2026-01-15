@@ -39,6 +39,10 @@ static String g_units = "metric"; // "metric" or "imperial"
 static uint32_t g_updateIntervalHours = 12; // Default 12 hours
 static uint8_t g_nightModeStartHour = 20;   // Night mode starts at 20:00 (8 PM)
 static uint8_t g_nightModeEndHour = 7;      // Night mode ends at 07:00 (7 AM)
+static int16_t g_timezoneOffset = 0;        // Timezone offset in hours (e.g., 2 for UTC+2)
+static bool g_enableDeepSleep = false;      // Enable/disable deep sleep (controlled by user)
+static int16_t g_timezoneOffset = 0;        // Timezone offset in hours (e.g., 2 for UTC+2)
+static bool g_enableDeepSleep = false;      // Enable/disable deep sleep (controlled by user)
 
 // ===== Weather data =====
 struct WeatherData {
@@ -313,19 +317,19 @@ static void renderWeatherSplitScreen(const WeatherData& current, const ForecastD
 
     // Current temperature (centered on left half)
     display.setFont(&FreeMonoBold12pt7b);
-    display.setCursor(12, 65);
+    display.setCursor(12, 90);
     display.print(tempNow);
     display.print("C");
 
     // Current condition
     display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(8, 80);
+    display.setCursor(8, 105);
     String cond = (current.main.length() ? current.main : String("Weather"));
     display.print(cond);
 
     // ---- VERTICAL DIVIDER ----
     int dividerX = display.width() / 2;
-    display.drawLine(dividerX, 22, dividerX, display.height(), GxEPD_BLACK);
+    display.drawLine(dividerX, 28, dividerX, display.height(), GxEPD_BLACK);
 
     // ---- TOMORROW'S FORECAST (Right side) ----
     display.setFont(&FreeMonoBold9pt7b);
@@ -333,16 +337,16 @@ static void renderWeatherSplitScreen(const WeatherData& current, const ForecastD
     display.print("Tomorrow");
 
     // Small icon for tomorrow
-    drawWeatherIcon(dividerX + 12, 42, tomorrow.iconCode, tomorrow.weatherId, tomorrow.main);
+    drawWeatherIcon(dividerX + 12, 28, tomorrow.iconCode, tomorrow.weatherId, tomorrow.main);
 
     // Tomorrow temps
     display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(dividerX + 8, 78);
+    display.setCursor(dividerX + 8, 88);
     display.print("Min: ");
     display.print(tMin);
     display.print("C");
 
-    display.setCursor(dividerX + 8, 96);
+    display.setCursor(dividerX + 8, 106);
     display.print("Max: ");
     display.print(tMax);
     display.print("C");
@@ -360,7 +364,11 @@ static void loadSettings() {
   g_updateIntervalHours = prefs.getUInt("interval", 12); // Default 12 hours
   g_nightModeStartHour = prefs.getUChar("nightStart", 20); // Default 20:00
   g_nightModeEndHour = prefs.getUChar("nightEnd", 7);     // Default 07:00
+  g_timezoneOffset = prefs.getShort("tzOffset", 0);       // Default UTC+0
+  g_enableDeepSleep = prefs.getBool("deepSleep", false);  // Default disabled
   prefs.end();
+  
+  Serial.printf("Loaded settings - Timezone: UTC%+d, Deep sleep: %s\n", g_timezoneOffset, g_enableDeepSleep ? "ON" : "OFF");
 }
 
 static void saveSettings(const String& apiKey, const String& city) {
@@ -370,6 +378,8 @@ static void saveSettings(const String& apiKey, const String& city) {
   prefs.putUInt("interval", g_updateIntervalHours);
   prefs.putUChar("nightStart", g_nightModeStartHour);
   prefs.putUChar("nightEnd", g_nightModeEndHour);
+  prefs.putShort("tzOffset", g_timezoneOffset);
+  prefs.putBool("deepSleep", g_enableDeepSleep);
   prefs.end();
 }
 
@@ -548,11 +558,13 @@ static bool fetchForecast(ForecastData& out) {
   return true;
 }
 
-// ---------------- Time sync helper ----------------
+// ===== Time sync helper ================
 static void syncTime() {
-  // Configure NTP
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Syncing time...");
+  // Configure NTP with timezone offset
+  // Format: timezone offset in seconds, daylight saving offset
+  int32_t tzOffset = g_timezoneOffset * 3600; // Convert hours to seconds
+  configTime(tzOffset, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.printf("Syncing time with timezone offset %d hours (%d seconds)...\n", g_timezoneOffset, tzOffset);
   
   int retries = 0;
   while (time(nullptr) < 100000 && retries < 20) {
@@ -563,7 +575,11 @@ static void syncTime() {
   Serial.println();
   
   if (time(nullptr) > 100000) {
-    Serial.println("Time synced successfully");
+    time_t now = time(nullptr);
+    struct tm* tm_info = localtime(&now);
+    char timeBuf[32];
+    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", tm_info);
+    Serial.printf("Time synced successfully: %s\n", timeBuf);
   } else {
     Serial.println("Time sync failed, using relative time");
   }
@@ -617,8 +633,8 @@ void setup() {
   // Sync time from NTP
   syncTime();
 
-  Serial.printf("Current time check - Hour: %d, Night mode start: %d, Night mode end: %d\n", 
-                localtime(&(time_t){time(nullptr)})->tm_hour, g_nightModeStartHour, g_nightModeEndHour);
+  //Serial.printf("Current time check - Hour: %d, Night mode start: %d, Night mode end: %d\n", 
+  //              localtime(&(time_t){time(nullptr)})->tm_hour, g_nightModeStartHour, g_nightModeEndHour);
   
   // Check if night mode is active and fetch appropriate data
   if (isNightMode()) {
@@ -662,14 +678,18 @@ void setup() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  Serial.println("Display rendered successfully. Press any key to continue or device will sleep in 10 seconds...");
-  delay(10000);  // Wait 10 seconds before deep sleep - gives time to check output
-
-  // Enter deep sleep for configured interval
-  uint64_t sleepTime = g_updateIntervalHours * 3600ULL * 1000000ULL; // Convert hours to microseconds
-  Serial.printf("Going to sleep for %u hours...\n", g_updateIntervalHours);
-  esp_sleep_enable_timer_wakeup(sleepTime);
-  esp_deep_sleep_start();
+  Serial.println("Display rendered successfully.");
+  
+  if (g_enableDeepSleep) {
+    uint64_t sleepTime = g_updateIntervalHours * 3600ULL * 1000000ULL;
+    Serial.printf("Deep sleep enabled - entering sleep for %u hours...\n", g_updateIntervalHours);
+    esp_sleep_enable_timer_wakeup(sleepTime);
+    esp_deep_sleep_start();
+  } else {
+    Serial.println("Deep sleep disabled. Device will remain active.");
+    Serial.println("To enable deep sleep, set g_enableDeepSleep = true via WiFi portal or serial command.");
+    delay(10000);  // Wait 10 seconds for user to see message
+  }
 }
 
 void loop() {
